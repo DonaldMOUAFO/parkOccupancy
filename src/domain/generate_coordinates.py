@@ -8,7 +8,7 @@ class CoordinateGenerator :
 
     def __init__(self, image_path):
 
-        self.image   = cv2.imread(image_path)
+        self.image = cv2.imread(image_path)
 
         if self.image is None:
             raise ValueError(f"""Image at {image_path} could not be loaded. 

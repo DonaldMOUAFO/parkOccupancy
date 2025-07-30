@@ -1,21 +1,34 @@
 import cv2 
+import json
+from os import path
 import numpy as np
 from PIL import Image
 from matplotlib import pyplot as plt
 
-from src.config.config import camera_image_view_path, bird_view_path
+from src.config.config import camera_image_view_path, bird_view_path, points_correspondance_file
 
 class DetectFeature :
     """Class to detect features in images using SIFT or ORB and compute homography."""
     
-    def __init__(self, method="sift"):
-        self.method = method.lower()
-        
-        if self.method not in ["sift", "orb"]:
-            raise ValueError("Method must be either 'sift' or 'orb'.")
-        
-        self.detector = self._initialize_detector(method)
-        self.matcher  = self._initialize_matcher()
+    def __init__(self, method="sift", from_pts=False):
+        self.FROM_PTS = from_pts
+
+        if self.FROM_PTS:
+            if not path.exists(points_correspondance_file):
+                raise FileNotFoundError(
+                    f"""Points correspondance file not found at {points_correspondance_file}. 
+                        check the file and load again."""
+                )
+            else:
+                with open(points_correspondance_file, 'r') as file:
+                    self.points_correspondance = json.load(file)
+        else :
+            self.method = method.lower()
+            if self.method not in ["sift", "orb"]:
+                raise ValueError("Method must be either 'sift' or 'orb'.")
+            
+            self.detector = self._initialize_detector(method)
+            self.matcher  = self._initialize_matcher()
 
     def _initialize_detector(self, method):
         if method == "sift":
@@ -52,20 +65,41 @@ class DetectFeature :
               good_matches.append(m)
        return good_matches
        
-    def compute_homography(self, img1, img2):
+    def compute_homography(self, *args):
         """Main pipeline: detect → match → estimate homography"""
-        kp1, des1 = self.detect_and_compute(img1)
-        kp2, des2 = self.detect_and_compute(img2)
 
-        matches = self.match_features(des1, des2)
+        if self.FROM_PTS:
 
-        if len(matches) < 10:
-            raise ValueError("Not enough matches to compute homography.")
+            if len(self.points_correspondance) < 10:
+                raise ValueError("Not enough points to compute homography.")
+            else :
+                pts_correspondance = list( self.points_correspondance.values() )
+                # Convert points to numpy arrays
+                kp1 = np.float32([pt[0] for pt in pts_correspondance]).reshape(-1, 1, 2) # camera_pts
+                kp2 = np.float32([pt[1] for pt in pts_correspondance]).reshape(-1, 1, 2) # bird_eye_pts
+                # Compute homography using RANSAC
+                H, mask = cv2.findHomography(kp1, kp2, cv2.RANSAC, 5.0)
+                # return H, None, None, None, mask
+        
+        else :
+            if len(args) != 2:
+                raise ValueError("Two images are required to compute homography.")
+            img1, img2 = args
+            # If not using pre-defined points, proceed with feature detection and matching
+            kp1, des1 = self.detect_and_compute(img1)
+            kp2, des2 = self.detect_and_compute(img2)
 
-        src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
-        dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+            matches = self.match_features(des1, des2)
 
-        H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+            if len(matches) < 10:
+                raise ValueError("Not enough matches to compute homography.")
+
+            src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+            dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+
+            H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+            
+            # return H, matches, kp1, kp2, mask
         return H, matches, kp1, kp2, mask
         
     def draw_matches(self, img1, kp1, img2, kp2, matches, mask):
@@ -96,9 +130,9 @@ H, matches, kp1, kp2, mask = DetectFeature.compute_homography(
    np.array(normal_view), np.array(top_image_view)
 )
 
-H, matches, kp1, kp2, mask = DetectFeature.compute_homography(
-    np.array(top_image_view), np.array(normal_view)
-    )
+#H, matches, kp1, kp2, mask = DetectFeature.compute_homography(
+#    np.array(top_image_view), np.array(normal_view)
+#    )
 
 matched_image = DetectFeature.draw_matches(
     np.array(normal_view), kp1,
