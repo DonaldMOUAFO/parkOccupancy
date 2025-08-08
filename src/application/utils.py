@@ -1,3 +1,4 @@
+import numpy as np
 from os import path
 import cv2
 
@@ -58,4 +59,27 @@ def draw_contours(image,
         image, label, center, font, font_scale, 
         font_color, line_thickness, cv2.LINE_AA
     )
-        
+
+def load_homography_matrix(homography_matrix_path):
+    """
+    Load the homography matrix from a file
+    """
+    if path.exists(homography_matrix_path):
+        print(f"==== Load the homography matrix from {homography_matrix_path} ====")
+        H = np.load(homography_matrix_path)
+        if H.shape != (3, 3):
+            raise ValueError("Homography matrix must be of shape (3, 3)")
+        print(f"==== Homography matrix loaded successfully ====")
+        print(f"==== Shape of the homography matrix: {H.shape} ====")
+        return H
+    else:
+        print(f"==== Could not read the homography matrix file {homography_matrix_path} ====")
+        return None
+    
+def show_image(image, window_name="Image"):
+    """
+    Show image in a window
+    """
+    cv2.imshow(window_name, image)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
