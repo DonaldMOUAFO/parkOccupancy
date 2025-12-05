@@ -114,7 +114,7 @@ def draw_contours(image,
         font_color, line_thickness, cv2.LINE_AA
     )
 
-with open(coordinate_file, 'w') as outpu:
-    Generator = ParkingCoordinatesGenerator(image_path, outpu)
+with open(coordinate_file, 'w') as output:
+    Generator = ParkingCoordinatesGenerator(image_path, output)
     # Generator.mouse_call_back()
     Generator.generate()

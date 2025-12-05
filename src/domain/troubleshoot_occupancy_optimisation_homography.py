@@ -1,0 +1,457 @@
+"""
+High-performance async parking occupancy system
+- Async capture (threaded) for high-FPS RTSP
+- Worker pool for TensorRT / Ultralytics inference + DeepSort
+- Homography-based parking slot detection:
+    * automatic attempt (Canny + Hough on top-down)
+    * manual grid fallback (provide 4 corners + rows/cols)
+- Per-slot occupancy and visual overlay
+"""
+
+import cv2
+import time
+import threading
+import queue
+import numpy as np
+from ultralytics import YOLO
+from deep_sort_realtime.deepsort_tracker import DeepSort
+
+# ------------------------------
+# =========== CONFIG ===========
+# ------------------------------
+VIDEO_URL = "rtsp://username:pass@camera:554/stream"  # or local file
+ENGINE_PATH = "yolo11s_fp16.engine"   # or .pt / .onnx / engine
+USE_TENSORRT_ENGINE = True            # True if ENGINE_PATH is a TensorRT engine
+DETECTION_INTERVAL = 4                # detect every N frames (1 = every frame)
+NUM_WORKERS = 2                       # number of worker threads (inference)
+CAPTURE_QUEUE_MAX = 8                 # bounded queue sizes
+DISPLAY_QUEUE_MAX = 8
+MOTION_THRESHOLD = 3
+FRAME_TO_PARK = 25
+TOTAL_SLOTS = 25
+
+# Homography / slots
+# If you already know the 4 corners (in image coords) of the parking ground (clockwise),
+# set MANUAL_HOMOGRAPHY = True and provide PARK_SRC_POINTS. Then set GRID_ROWS x GRID_COLS.
+MANUAL_HOMOGRAPHY = False
+
+# Example: PARK_SRC_POINTS = np.array([[x0,y0],[x1,y1],[x2,y2],[x3,y3]], dtype=np.float32)
+PARK_SRC_POINTS = None
+GRID_ROWS = 5
+GRID_COLS = 5
+
+# Automatic detection parameters (top-down)
+AUTO_HOUGH_RHO = 1
+AUTO_HOUGH_THETA = np.pi / 180
+AUTO_HOUGH_THRESH = 100
+AUTO_SLOT_MIN_WIDTH = 30     # px in top-down coordinates (tune per scene)
+
+# ------------------------------
+# ======== END CONFIG ==========
+# ------------------------------
+
+# ------------------------------
+# ========== Globals ===========
+# ------------------------------
+capture_queue = queue.Queue(maxsize=CAPTURE_QUEUE_MAX)
+display_queue = queue.Queue(maxsize=DISPLAY_QUEUE_MAX)
+stop_event = threading.Event()
+
+# Shared tracking state (thread-safe access via simple locks)
+state_lock = threading.Lock()
+last_positions = {}
+no_motion_frames = {}
+PARKED = set()
+object_names = {}
+active_tracks = {}   # track_id -> bbox (x1,y1,x2,y2)
+frame_counter = 0
+
+# Load model (Ultralytics)
+print("Loading model...")
+model = YOLO(ENGINE_PATH)  # loads engine/onnx/pt transparently
+# If using PT and want GPU: model.to('cuda')
+# If engine is TensorRT, it's GPU-native.
+
+# Initialize external DeepSort (we use an external tracker for better robustness)
+deep_sort = DeepSort(max_age=30)
+
+# ------------------------------
+# ==== Homography utilities ====
+# ------------------------------
+def compute_homography_from_manual(src_pts):
+    """Given 4 image pts (clockwise), return H and inverse H and top-down size."""
+    # We'll map src polygon to a rectangle of width = max x span, height = max y span
+    # Compute bounding rect in src plane
+    src = np.array(src_pts, dtype=np.float32)
+    # estimate target width/height based on polygon extents
+    minx, miny = src.min(axis=0)
+    maxx, maxy = src.max(axis=0)
+    w = int(maxx - minx)
+    h = int(maxy - miny)
+    dst = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32)
+    H, _ = cv2.findHomography(src, dst)
+    H_inv, _ = cv2.findHomography(dst, src)
+    return H, H_inv, (w, h)
+
+def detect_parking_grid_topdown(frame, H, invH, top_size, rows=GRID_ROWS, cols=GRID_COLS):
+    """
+    Attempt automatic slot detection on top-down image:
+    - warp to top-down with H
+    - run Canny + Hough lines to detect parking line orientations
+    - if enough parallel lines found, create slots by splitting the bounding area
+    Returns a list of slot polygons in image coordinates (list of 4 points).
+    """
+    top = cv2.warpPerspective(frame, H, top_size)
+    gray = cv2.cvtColor(top, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5,5), 0)
+    edges = cv2.Canny(blur, 50, 150)
+
+    # Hough Lines
+    lines = cv2.HoughLines(edges, AUTO_HOUGH_RHO, AUTO_HOUGH_THETA, AUTO_HOUGH_THRESH)
+    if lines is None:
+        return None  # automatic failed
+
+    # Convert to (rho,theta) and cluster thetas to find dominant orientation
+    thetas = np.array([l[0][1] for l in lines])
+    median_theta = np.median(thetas)
+
+    # Rotate top-down so that parking lines become vertical (for easy grid)
+    angle = (median_theta - (np.pi/2))
+    Mrot = cv2.getRotationMatrix2D((top_size[0]//2, top_size[1]//2), np.degrees(angle), 1.0)
+    top_rot = cv2.warpAffine(top, Mrot, top_size)
+    gray_r = cv2.cvtColor(top_rot, cv2.COLOR_BGR2GRAY)
+    edges_r = cv2.Canny(gray_r, 50, 150)
+    lines_r = cv2.HoughLinesP(edges_r, 1, np.pi/180, threshold=80, minLineLength=50, maxLineGap=10)
+    if lines_r is None:
+        return None
+
+    # Collect x-positions of near-vertical lines
+    xs = []
+    for x1,y1,x2,y2 in lines_r.reshape(-1,4):
+        if abs(x2 - x1) < 20:  # near vertical
+            xs.append((x1 + x2) // 2)
+
+    if len(xs) < cols - 1:
+        # Not enough lines detected to separate columns → fail
+        return None
+
+    xs = np.array(sorted(xs))
+    # Choose the most spread xs and create cols
+    min_x = xs.min()
+    max_x = xs.max()
+    # Build grid in rotated top-down coords
+    slot_width = (max_x - min_x) / cols
+    h = top_size[1]
+    slots_td = []
+    for c in range(cols):
+        x0 = int(min_x + c * slot_width)
+        x1 = int(min_x + (c+1) * slot_width)
+        # create one slot rectangle spanning full height (rows can be used to split vertically if needed)
+        rect = np.array([[x0, 0], [x1, 0], [x1, h], [x0, h]], dtype=np.float32)
+        # rotate back (inverse of Mrot) then warp back to image coords via invH
+        # first invert rotation on rect
+        ones = np.ones((rect.shape[0], 1))
+        pts = np.hstack([rect, ones])
+        Mrot_3 = np.vstack([Mrot, [0,0,1]])
+        Mrot_inv = np.linalg.inv(Mrot_3)[0:2, :]
+        rect_unrot = (Mrot_inv @ pts.T).T[:, :2]
+        # now map back to image coordinates
+        rect_img = cv2.perspectiveTransform(rect_unrot.reshape(1, -1, 2), invH)[0]  # shape (4,2)
+        slots_td.append(np.int32(rect_img))
+    # If we have fewer than requested slots, fail
+    if len(slots_td) < cols:
+        return None
+    
+    return slots_td
+
+def generate_grid_slots_from_manual(H_inv, top_size, rows=GRID_ROWS, cols=GRID_COLS):
+    """
+    Deterministic grid generation in top-down plane: split top-down rect into rows x cols.
+    Returns list of polygons in image coordinates.
+    """
+    w, h = top_size
+    slot_w = w / cols
+    slot_h = h / rows
+    slots = []
+    for r in range(rows):
+        for c in range(cols):
+            x0 = c * slot_w
+            y0 = r * slot_h
+            x1 = (c+1) * slot_w
+            y1 = (r+1) * slot_h
+            rect = np.array([[x0,y0],[x1,y0],[x1,y1],[x0,y1]], dtype=np.float32).reshape(1,-1,2)
+            poly_img = cv2.perspectiveTransform(rect, H_inv)[0].astype(np.int32)
+            slots.append(poly_img)
+            
+    return slots
+
+# ------------------------------
+# ===== Async pipeline =========
+# ------------------------------
+def capture_thread_fn(url, q, stop_evt):
+    cap = cv2.VideoCapture(url)
+    if not cap.isOpened():
+        print("ERROR: Unable to open capture:", url)
+        stop_evt.set()
+        return
+    while not stop_evt.is_set():
+        ret, frame = cap.read()
+        if not ret:
+            # try a short sleep and continue (RTSP sometimes drops)
+            time.sleep(0.01)
+            continue
+        # keep latest frames only: if queue full, drop one
+        try:
+            q.put(frame, timeout=0.02)
+        except queue.Full:
+            try:
+                _ = q.get_nowait()  # drop oldest
+            except queue.Empty:
+                pass
+            try:
+                q.put(frame, timeout=0.02)
+            except queue.Full:
+                pass
+    cap.release()
+
+def worker_thread_fn(in_q, out_q, stop_evt, worker_id=0):
+    global frame_counter
+    while not stop_evt.is_set():
+        try:
+            frame = in_q.get(timeout=0.1)
+        except queue.Empty:
+            continue
+        frame_counter += 1
+        # detection vs tracking frequency controlled by DETECTION_INTERVAL
+        do_detect = (frame_counter % DETECTION_INTERVAL == 0)
+
+        # Use model.track() (this uses Ultralytics internal tracker if enabled).
+        # For maximum throughput with external DeepSort, you could run model.predict() and then deep_sort.update_tracks()
+        # Here we continue using model.track() to keep things simple and robust.
+        if do_detect:
+            results = model.track(frame, persist=True, verbose=False)
+        else:
+            results = model.track(frame, persist=True, verbose=False)  # keep calling track (fast with engine)
+
+        detections = []
+        current_ids = set()
+        # parse results
+        if results is not None:
+            for r in results:
+                if r.boxes is None:
+                    continue
+                for box in r.boxes:
+                    cls = int(box.cls[0])
+                    if cls not in [2,3,5,7]:  # vehicle classes
+                        continue
+                    track_id = int(box.id[0]) if box.id is not None else -1
+                    x1,y1,x2,y2 = map(int, box.xyxy[0])
+                    conf = float(box.conf[0])
+                    detections.append(([x1,y1,x2-x1,y2-y1], conf, cls))
+                    current_ids.add(track_id)
+                    # store box for drawing
+                    with state_lock:
+                        active_tracks[track_id] = (x1,y1,x2,y2)
+
+        # If you want to use external DeepSort:
+        # tracks = deep_sort.update_tracks(detections, frame=frame)
+        # ... and then read t.to_ltrb() as before.
+
+        # Motion + parked logic based on active_tracks
+        with state_lock:
+            # update motion counts
+            for tid in list(current_ids):
+                if tid not in active_tracks:
+                    continue
+                x1,y1,x2,y2 = active_tracks[tid]
+                cx = (x1 + x2)//2
+                cy = (y1 + y2)//2
+                if tid in last_positions:
+                    px,py = last_positions[tid]
+                    dist = np.hypot(cx-px, cy-py)
+                else:
+                    dist = 9999
+                if dist < MOTION_THRESHOLD:
+                    no_motion_frames[tid] = no_motion_frames.get(tid, 0) + 1
+                else:
+                    no_motion_frames[tid] = 0
+                last_positions[tid] = (cx, cy)
+                if no_motion_frames.get(tid,0) >= FRAME_TO_PARK:
+                    PARKED.add(tid)
+                    object_names[tid] = model.names[ int(box.cls[0]) ]  # best-effort last known class
+
+            # remove parked that disappeared
+            for tid in list(PARKED):
+                if tid not in current_ids:
+                    PARKED.remove(tid)
+
+        # annotate frame with bounding boxes & IDs (simple)
+        annotated = frame.copy()
+        with state_lock:
+            for tid, bbox in active_tracks.items():
+                x1,y1,x2,y2 = bbox
+                color = (0,255,0) if tid in PARKED else (255,255,0)
+                cv2.rectangle(annotated, (x1,y1),(x2,y2), color, 2)
+                cv2.putText(annotated, f"ID {tid}", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+        # push to display queue (drop if full)
+        try:
+            out_q.put_nowait(annotated)
+        except queue.Full:
+            try:
+                _ = out_q.get_nowait()
+                out_q.put_nowait(annotated)
+            except queue.Empty:
+                pass
+
+# ------------------------------
+# ======= Main display =========
+# ------------------------------
+def main():
+    global PARKED
+    # prepare homography / slots
+    H = None; H_inv = None; top_size = None; slots = None
+
+    if MANUAL_HOMOGRAPHY and PARK_SRC_POINTS is not None:
+        H, H_inv, top_size = compute_homography_from_manual(PARK_SRC_POINTS)
+        slots = generate_grid_slots_from_manual(H_inv, top_size, rows=GRID_ROWS, cols=GRID_COLS)
+        print(f"Generated {len(slots)} slots from manual grid")
+    else:
+        # If automatic: we need a sample frame to compute H via user-selection of polygon
+        # For robust solution, let user pick 4 corners via a single frame if not provided
+        # We'll grab one frame from the capture queue (blocking until available)
+        print("Waiting for first frame to compute homography/attempt auto-detection...")
+        sample = None
+        while sample is None:
+            try:
+                sample = capture_queue.get(timeout=5.0)
+            except queue.Empty:
+                print("No frames yet...")
+                time.sleep(0.5)
+                continue
+        # Ask user to click 4 corners if not provided
+        if PARK_SRC_POINTS is None:
+            print("Please click 4 points (clockwise) that enclose the parking region in the displayed window.")
+            pts = []
+
+            def onclick(event, x, y, flags, param):
+                if event == cv2.EVENT_LBUTTONDOWN:
+                    pts.append((x,y))
+                    print("Point:", x,y)
+
+            clone = sample.copy()
+            cv2.namedWindow("Select region")
+            cv2.setMouseCallback("Select region", onclick)
+            while True:
+                disp = clone.copy()
+                for p in pts:
+                    cv2.circle(disp, p, 4, (0,255,0), -1)
+                cv2.imshow("Select region", disp)
+                k = cv2.waitKey(1) & 0xFF
+                if k == ord('q'):
+                    break
+                if len(pts) >= 4:
+                    break
+            cv2.destroyWindow("Select region")
+            if len(pts) < 4:
+                print("Insufficient points selected; falling back to whole-frame as source polygon.")
+                h,w = sample.shape[:2]
+                pts = [(0,0),(w-1,0),(w-1,h-1),(0,h-1)]
+            PARK_SRC = np.array(pts[:4], dtype=np.float32)
+            H, H_inv, top_size = compute_homography_from_manual(PARK_SRC)
+
+        # Try automatic detection on top-down
+        print("Attempting automatic top-down slot detection...")
+        auto_slots = detect_parking_grid_topdown(sample, H, H_inv, top_size, rows=GRID_ROWS, cols=GRID_COLS)
+        if auto_slots:
+            slots = auto_slots
+            print(f"Auto-detected {len(slots)} slots.")
+        else:
+            print("Auto-detection failed; using regular manual grid.")
+            slots = generate_grid_slots_from_manual(H_inv, top_size, rows=GRID_ROWS, cols=GRID_COLS)
+
+    # Start worker threads
+    workers = []
+    for i in range(NUM_WORKERS):
+        t = threading.Thread(target=worker_thread_fn, args=(capture_queue, display_queue, stop_event, i), daemon=True)
+        t.start()
+        workers.append(t)
+
+    # Start capture thread
+    cap_thr = threading.Thread(target=capture_thread_fn, args=(VIDEO_URL, capture_queue, stop_event), daemon=True)
+    cap_thr.start()
+
+    # Display loop (runs in main thread)
+    try:
+        fps_meter_t0 = time.time()
+        fps_count = 0
+        while not stop_event.is_set():
+            try:
+                annotated = display_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+
+            fps_count += 1
+            if time.time() - fps_meter_t0 >= 1.0:
+                print("FPS:", fps_count)
+                fps_count = 0
+                fps_meter_t0 = time.time()
+
+            # draw parking slot overlay (semi-transparent)
+            frame_disp = annotated.copy()
+            overlay = frame_disp.copy()
+            for idx, poly in enumerate(slots):
+                cv2.polylines(overlay, [poly], True, (0,255,0), 2)
+                # fill lightly
+                cv2.fillPoly(overlay, [poly], (0,255,0))
+            # blend
+            frame_disp = cv2.addWeighted(overlay, 0.15, frame_disp, 0.85, 0)
+
+            # compute per-slot occupancy (based on center of tracked parked vehicles)
+            slot_occupied = [False] * len(slots)
+            with state_lock:
+                for tid in PARKED:
+                    if tid not in last_positions:
+                        continue
+                    cx,cy = last_positions[tid]
+                    # test membership in each slot polygon
+                    for i_slot, poly in enumerate(slots):
+                        val = cv2.pointPolygonTest(poly, (cx,cy), False)
+                        if val >= 0:
+                            slot_occupied[i_slot] = True
+                            break
+
+            # draw slot occupancy labels
+            for i_slot, poly in enumerate(slots):
+                # compute centroid for label
+                M = cv2.moments(poly)
+                if M["m00"] != 0:
+                    cx = int(M["m10"]/M["m00"])
+                    cy = int(M["m01"]/M["m00"])
+                else:
+                    cx, cy = poly.mean(axis=0).astype(int)
+                color = (0,0,255) if slot_occupied[i_slot] else (0,255,0)
+                cv2.putText(frame_disp, f"{i_slot+1}", (cx-10, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+            # draw counts
+            with state_lock:
+                parked_count = len(PARKED)
+            free_spots = max(0, TOTAL_SLOTS - parked_count)
+            cv2.putText(frame_disp, f"Parked: {parked_count}", (20,40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+            cv2.putText(frame_disp, f"Free slots approx: {free_spots}", (20,80), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,0), 2)
+
+            # Show
+            cv2.imshow("Async Parking - Slots", frame_disp)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                stop_event.set()
+                break
+    except KeyboardInterrupt:
+        stop_event.set()
+    finally:
+        stop_event.set()
+        time.sleep(0.2)
+        cv2.destroyAllWindows()
+        print("Shutting down...")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,167 @@
+[
+  {
+    "id": 1,
+    "class": 7,
+    "bbox": [
+      275,
+      415,
+      757,
+      678
+    ],
+    "state": "PARKED",
+    "last_seen": 1763998076.367225
+  },
+  {
+    "id": 2,
+    "class": 7,
+    "bbox": [
+      0,
+      549,
+      455,
+      954
+    ],
+    "state": "PARKED",
+    "last_seen": 1763998076.367225
+  },
+  {
+    "id": 3,
+    "class": 7,
+    "bbox": [
+      561,
+      300,
+      978,
+      474
+    ],
+    "state": "PARKED",
+    "last_seen": 1763998076.367225
+  },
+  {
+    "id": 4,
+    "class": 2,
+    "bbox": [
+      16,
+      437,
+      119,
+      490
+    ],
+    "state": "PARKED",
+    "last_seen": 1763998076.367225
+  },
+  {
+    "id": 5,
+    "class": 2,
+    "bbox": [
+      149,
+      396,
+      239,
+      441
+    ],
+    "state": "PARKED",
+    "last_seen": 1763998076.367225
+  },
+  {
+    "id": 6,
+    "class": 7,
+    "bbox": [
+      872,
+      190,
+      1156,
+      322
+    ],
+    "state": "PARKED",
+    "last_seen": 1763998076.367225
+  },
+  {
+    "id": 8,
+    "class": null,
+    "bbox": [],
+    "state": "PARKED",
+    "last_seen": null
+  },
+  {
+    "id": 9,
+    "class": 7,
+    "bbox": [
+      535,
+      189,
+      717,
+      303
+    ],
+    "state": "PARKED",
+    "last_seen": 1763998076.367225
+  },
+  {
+    "id": 10,
+    "class": null,
+    "bbox": [],
+    "state": "PARKED",
+    "last_seen": null
+  },
+  {
+    "id": 11,
+    "class": null,
+    "bbox": [],
+    "state": "PARKED",
+    "last_seen": null
+  },
+  {
+    "id": 13,
+    "class": 7,
+    "bbox": [
+      1001,
+      122,
+      1241,
+      202
+    ],
+    "state": "PARKED",
+    "last_seen": 1763998076.367225
+  },
+  {
+    "id": 14,
+    "class": 7,
+    "bbox": [
+      652,
+      251,
+      872,
+      306
+    ],
+    "state": "PARKED",
+    "last_seen": 1763998076.367225
+  },
+  {
+    "id": 21,
+    "class": 2,
+    "bbox": [
+      1763,
+      0,
+      1784,
+      19
+    ],
+    "state": "PARKED",
+    "last_seen": 1763998075.7888262
+  },
+  {
+    "id": 43,
+    "class": 2,
+    "bbox": [
+      1674,
+      23,
+      1707,
+      50
+    ],
+    "state": "PARKED",
+    "last_seen": 1763998076.367225
+  },
+  {
+    "id": 101,
+    "class": 2,
+    "bbox": [
+      1768,
+      58,
+      1803,
+      83
+    ],
+    "state": "PARKED",
+    "last_seen": 1763998076.367225
+  }
+]

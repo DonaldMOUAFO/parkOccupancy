@@ -13,3 +13,5 @@ data/*.png
 data/*.avi
 data/*.zip
 data/*.rar
+data/scale/*
+YOLO-3D/
